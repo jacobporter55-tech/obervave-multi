@@ -9,6 +9,18 @@
 #define REV_DIV 2u
 #endif
 #define RVL(x) ((uint32_t)((x) * 44100u / 29761u / REV_DIV))   /* the paper's 29761 Hz lengths at our rate */
+#ifndef SH_DECAY
+#define SH_DECAY 30500                          /* 0.93 */
+#endif
+#ifndef SH_FB
+#define SH_FB 26000
+#endif
+#ifndef SH_TONE
+#define SH_TONE 150
+#endif
+#ifndef SH_DAMP
+#define SH_DAMP 29000
+#endif
 #define SH_N 4096u                              /* the shimmer's line: 93 ms */
 #define SH_W 2048u                              /* a grain: 46 ms, two heads half a grain apart */
 #define CHO_N 1024u
@@ -106,17 +118,19 @@ static void fx_block(const patch_t *p, uint32_t quarter, uint32_t any_c, uint32_
     cho_mix = any_c != 0;                       /* the sends carry the levels: the returns are at full */
     sh_mix = any_d != 0;                        /* P_DLY_MIX is each part's SHIMMER send now */
     rev_mix = any_r != 0;
-    sh_fb = p->v[P_DLY_FB] * 100;               /* BLOOM: the tail back into the shifter, up to 0.39, less as it grows */
-    t = p->v[P_DLY_TONE]; sh_tone_k = clampi(((t * t) >> 6) + 8, 8, 256);   /* TONE: the shifted sound's brightness */
-    d = p->v[P_REV_SIZE]; rev_decay = 12000 + ((d * d * 19500) >> 14);   /* 0.37 .. 0.96: the top is a near-freeze */
-    d = p->v[P_REV_DAMP]; rev_damp_k = 32768 - d * d * 2;   /* the one-pole's k at the half rate */
+    /* the pad-and-drone build: one long shimmer hall, set here (the patches' reverb and shimmer knobs are not used) */
+    sh_fb = SH_FB;                              /* the tail back into the shifter (ridden down as it grows) */
+    sh_tone_k = SH_TONE;                        /* the shifted sound's brightness */
+    rev_decay = SH_DECAY;                       /* the plate's decay */
+    rev_damp_k = SH_DAMP;                       /* the one-pole's k at the half rate */
+    (void)t;
     if (REV_DIV == 1u) {                        /* the same corner at the full rate: k' = 1 - sqrt(1 - k) */
         uint32_t x = (uint32_t)(32768 - rev_damp_k) << 15, r = 0, bit = 1u << 15;
         for (; bit; bit >>= 1)
             if ((r + bit) * (r + bit) <= x) r += bit;
         rev_damp_k = 32768 - (int32_t)r;
     }
-    rev_pre_n = 1u + (uint32_t)p->v[P_REV_PRE] * (41u / REV_DIV);
+    rev_pre_n = 1u + 30u * (41u / REV_DIV);      /* ~28 ms */
     if (sh_mix) sh_active = 24u * FS; else if (sh_active > HALF_FRAMES) sh_active -= HALF_FRAMES; else sh_active = 0;
     if (rev_mix || sh_active) rev_active = 24u * FS; else if (rev_active > HALF_FRAMES) rev_active -= HALF_FRAMES; else rev_active = 0;
 }
@@ -213,7 +227,7 @@ static void fx_process(int32_t *out, const int32_t *bc, const int32_t *bd, const
 {
     uint32_t i, do_sh = sh_active != 0, do_rev = rev_active != 0;
     int32_t cm = cho_mix;
-    sh_fb_now = (int32_t)((uint32_t)((sh_fb * (32768 - rev_decay)) >> 13) * 2048u / (2048u + (uint32_t)sh_env));   /* the louder the bloom, the less goes
+    sh_fb_now = (int32_t)((uint32_t)sh_fb * 2048u / (2048u + (uint32_t)sh_env));   /* the louder the bloom, the less goes
                                                    round again: it cannot run away, even with the reverb near a freeze */
     for (i = 0; i < n; i++) {
         int32_t l = out[2u * i], r = out[2u * i + 1u], rin = softclip(br[i]);   /* the sends soft-clipped as the dry is:

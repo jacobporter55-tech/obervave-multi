@@ -88,7 +88,7 @@ typedef struct {
     int32_t lvl1, lvl2, lvln, drive_q12, reso_k, vint, sus_f, sus_a, vol_q12, morph_q;
     int32_t cut_sm, reso_sm;                    /* CUTOFF and RESO slewed (Q8), ~25 ms: a CC sweep in semitone steps glides */
     uint32_t pw1_base, pw2_base, w1, w2, ftype, sync_on, xmod_q, glide_k;
-    int32_t snd_c, snd_d, snd_r;                /* the effect sends, Q8 */
+    int32_t snd_c, snd_d, snd_r, dry;           /* the effect sends, Q8; the dry left by the shimmer, Q8 */
     uint32_t lfo_ph, lfo_rnd_a, lfo_rnd_b;      /* each part has its own LFO */
     int32_t lfo_val;                            /* this block, Q15 */
     int32_t last_pitch16;                       /* where a glide starts from */
@@ -534,7 +534,8 @@ static void block_globals(uint32_t p)           /* a part's derived numbers, onc
     d = live.v[P_XMOD]; xmod_q = (uint32_t)((d * d) >> 7);
     glide_k = GLIDE_K[live.v[P_GLIDE]];
     g->snd_c = live.v[P_CHO_MIX];                    /* as the old mix: the chorus takes this much of the dry */
-    g->snd_d = (live.v[P_DLY_MIX] * 180) >> 7;       /* wet up to 0.7 of the dry (Q8) */
+    g->snd_d = live.v[P_DLY_MIX];                    /* SHIMMER: the wet, at the dry's level at the top (Q8) ... */
+    g->dry = 256 - ((live.v[P_DLY_MIX] * live.v[P_DLY_MIX]) >> 6);   /* ... and the dry it leaves: 0 at the top */
     g->snd_r = (live.v[P_REV_MIX] * 180) >> 7;
     g->fenv_amt = fenv_amt; g->keytrk = keytrk; g->velflt = velflt; g->lfo_pd = lfo_pd; g->lfo_fd = lfo_fd;
     g->lfo_pwd = lfo_pwd; g->lfo_ad = lfo_ad; g->wheel_q = wheel_q; g->bend8 = bend8; g->env_o2 = env_o2;
@@ -622,7 +623,7 @@ static void voice_block(voice_t *v, uint32_t card)
     ui_vlevel[card] = v->amp1;
     v->amp1 = (v->amp1 * g->vol_q12) >> 12;     /* the part's volume (one part alone: as the old output stage) */
     ui_vnote[card] = v->note;
-    v->gd = 256 - g->snd_c;                     /* the mix: dry less what the chorus takes; the sends go through the part's bus */
+    v->gd = ((256 - g->snd_c) * g->dry) >> 8;                     /* the mix: dry less what the chorus takes; the sends go through the part's bus */
     v->gm = (g->snd_c | g->snd_d | g->snd_r) ? (v->gl + v->gr) >> 1 : 0;
 #undef live
 #define live (parts[focus])
@@ -691,7 +692,7 @@ static void engine_audio(int32_t *out, uint32_t n)
         any_d |= parts[p].v[P_DLY_MIX];
         any_r |= parts[p].v[P_REV_MIX];
     }
-    fx_block(&parts[0], ctl_ext_quarter ? ctl_ext_quarter : 60u * FS / clampi(ctl_tempo, 40, 240), any_c, any_d, any_r);
+    fx_block(&parts[2], ctl_ext_quarter ? ctl_ext_quarter : 60u * FS / clampi(ctl_tempo, 40, 240), any_c, any_d, any_r);
     for (i = 0; i < n; i++) bus_c[i] = bus_d[i] = bus_r[i] = 0;
     for (b = 0; b < n; b += CTL) {
         engine_events();

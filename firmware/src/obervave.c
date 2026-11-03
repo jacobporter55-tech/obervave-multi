@@ -125,12 +125,20 @@ static uint32_t level_of(uint32_t vel) { return vel <= 50u ? 0u : vel <= 85u ? 1
 static uint32_t seq_pages(uint32_t t) { return pat.trk[t].len ? (pat.trk[t].len + 15u) / 16u : 1u; }
 static uint8_t cc_map[128];                     /* MIDI CC -> parameter + 1, 0 = none */
 
+static uint32_t mix_keep;                       /* 1 once the parts are loaded at start */
+static void keep_mix(patch_t *p, const patch_t *old)   /* LAYER: a new preset keeps the layer's level and shimmer */
+{
+    if (set.midi_ch != MIDI_LAYER || !mix_keep) return;
+    p->v[P_VOLUME] = old->v[P_VOLUME];
+    p->v[P_DLY_MIX] = old->v[P_DLY_MIX];
+}
 static void load_program(uint32_t n)
 {
     patch_t p;
     n %= NPROG;
     if (set.used >> n & 1u) p = set.user[n];
     else patch_from_factory(&p, &FACTORY[n]);
+    keep_mix(&p, &live);
     live = p;
     prog = n;
     edited = 0;
@@ -143,6 +151,7 @@ static void load_program_part(uint32_t part, uint32_t n)   /* a program change o
     if (part == focus) { load_program(n); return; }
     if (set.used >> n & 1u) p = set.user[n];
     else patch_from_factory(&p, &FACTORY[n]);
+    keep_mix(&p, &parts[part]);
     parts[part] = p;
     set.pprog[part] = (uint8_t)n;
     part_ed[part] = 0;
@@ -197,9 +206,13 @@ static void layer_note(uint32_t p, uint32_t on, uint32_t note, uint32_t vel, uin
 }
 /* LAYER's home page and CC 102-105: the three layers' cutoffs (parts 1-3) and the drone's (part 3's) shimmer send */
 #define HOME_CC0 102u
+#define LAYER_HOME() (set.midi_ch == MIDI_LAYER && page == PG_PERFORM && !layer && !SMK_PAD_HELD)
+#define NLAYER 3u                               /* the simple pages: PAD 1, PAD 2, DRONE = parts 1-3 */
+static const char *const LAYER_NAME[NLAYER] = {"PAD 1", "PAD 2", "DRONE"};
 static void set_param(uint32_t p, int32_t v);
 static void set_param_part(uint32_t part, uint32_t p, int32_t v);
 static const uint8_t HOME_PART[4] = {0, 1, 2, 2}, HOME_PARAM[4] = {P_CUTOFF, P_CUTOFF, P_CUTOFF, P_DLY_MIX};
+static const uint8_t LAYER_PARAM[4] = {P_CUTOFF, P_AA, P_AR, P_VOLUME};
 static void home_set(uint32_t i, int32_t v)
 {
     uint32_t p = HOME_PART[i & 3u], q = HOME_PARAM[i & 3u];
@@ -663,14 +676,15 @@ static void draw_page(void)
             if (i == 0) { scat(k[i].value, "P"); fmt_u(k[i].value + 1, focus + 1u); k[i].v = focus; k[i].max = NPART - 1u; }
             else if (i < 3) { scat(k[i].value, "P"); fmt_u(k[i].value + 1, set.trk_part[i - 1u] + 1u); k[i].v = set.trk_part[i - 1u]; k[i].max = NPART - 1u; }
             else { fmt_u(k[i].value, live.v[P_VOLUME]); k[i].v = live.v[P_VOLUME]; k[i].max = 127; }
-        } else if (page == PG_PERFORM && set.midi_ch == MIDI_LAYER && !layer && !SMK_PAD_HELD) {
-            static const char *const HL[4] = {"CUT P1", "CUT P2", "CUT P3", "SHIMMER"};
-            uint32_t q = HOME_PARAM[i];
-            int32_t v = parts[HOME_PART[i]].v[q];
-            k[i].label = HL[i];
+        } else if (LAYER_HOME()) {             /* PAD 1 / PAD 2 / DRONE: the panel's layer */
+            static const char *const LL4[4] = {"CUTOFF", "ATTACK", "RELEASE", "LEVEL"};
+            uint32_t q = LAYER_PARAM[i];
+            if (i == 3u && focus == 2u) q = P_DLY_MIX;
+            k[i].label = i == 3u && focus == 2u ? "SHIMMER" : LL4[i];
             k[i].present = 1;
-            k[i].v = v; k[i].max = PDEF[q].max;
-            param_value(k[i].value, q, (uint32_t)v);
+            k[i].v = live.v[q]; k[i].max = PDEF[q].max;
+            if (q == P_DLY_MIX) { fmt_u(k[i].value, (uint32_t)live.v[q] * 100u / 127u); scat(k[i].value, "% WET"); }
+            else param_value(k[i].value, q, (uint32_t)live.v[q]);
         } else if (page == PG_ROUTE && !layer && !SMK_PAD_HELD) {
             static const char *const RL[4] = {"PART", "SOURCE", "LATCH", "VOLUME"};
             uint32_t sr = set.psrc[focus];
@@ -701,7 +715,8 @@ static void draw_page(void)
     {
         static char title[24];
         const char *t = pg->title;
-        if (layer == L_EDIT) t = seq_trk ? "EDIT B: ERASE" : "EDIT A: ERASE";
+        if (LAYER_HOME()) t = focus < NLAYER ? LAYER_NAME[focus] : "PERFORM";
+        else if (layer == L_EDIT) t = seq_trk ? "EDIT B: ERASE" : "EDIT A: ERASE";
         else if (layer == L_GLO) t = "GLO: MUTE SOLO TAP";
         else if (layer == L_SAVE) t = "SAVE: PATTERNS";
         else if (layer == L_FX) t = "FX MIX";
@@ -1034,6 +1049,7 @@ static void app_main(void)
     load_pattern(set.pat);
     ctl_panic = 0;
     route_apply();
+    mix_keep = 1;
 
     ui_splash();
     scope_state = 1;
@@ -1175,7 +1191,14 @@ static void app_main(void)
         if (b & (1u << BTN_HOME)) {             /* HOME: PERFORM; while a layer is held: lock it open; locked: let it go */
             if (layer && !layer_lock) { layer_lock = 1; layer_used = 1; say("LOCKED: ITS BUTTON ENDS IT"); }
             else if (layer_lock) { layer = L_NONE; layer_lock = 0; dirty_page = dirty_steps = dirty_tags = 1; leds_q = 0xFFFFFFFFu; }
-            else np = PG_PERFORM;
+            else if (set.midi_ch == MIDI_LAYER && page == PG_PERFORM) {   /* LAYER: HOME steps PAD 1 > PAD 2 > DRONE */
+                focus_set(focus + 1u < NLAYER ? focus + 1u : 0u);
+                dirty_hdr = dirty_tags = dirty_page = 1;
+                set_dirty = 1; set_t = fm1_ms;
+            } else {
+                np = PG_PERFORM;
+                if (set.midi_ch == MIDI_LAYER && focus >= NLAYER) focus_set(0);
+            }
         }
         if (b & ((1u << BTN_ENV) | (1u << BTN_LFO) | (1u << BTN_ARP)) && layer_lock) {   /* (another button lets a lock go) */
             layer = L_NONE; layer_lock = 0; b &= ~((1u << BTN_ENV) | (1u << BTN_LFO) | (1u << BTN_ARP));
@@ -1269,8 +1292,10 @@ static void app_main(void)
                 else set_param(P_VOLUME, (int32_t)live.v[P_VOLUME] + e);
                 set_dirty = 1; set_t = fm1_ms;
                 dirty_hdr = dirty_tags = 1;
-            } else if (page == PG_PERFORM && set.midi_ch == MIDI_LAYER && !layer && !SMK_PAD_HELD) {
-                home_set(k, (int32_t)parts[HOME_PART[k]].v[HOME_PARAM[k]] + e * 2);
+            } else if (LAYER_HOME()) {
+                uint32_t q = k == 3u && focus == 2u ? P_DLY_MIX : LAYER_PARAM[k];
+                set_param(q, (int32_t)live.v[q] + e * 2);
+                set_dirty = 1; set_t = fm1_ms;
                 dirty_hdr = dirty_tags = 1;
             } else if (page == PG_ROUTE && !layer && !SMK_PAD_HELD) {
                 int32_t d = e > 0 ? 1 : -1;
