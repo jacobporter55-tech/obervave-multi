@@ -141,7 +141,7 @@ static void cv_stripes(int32_t y0, int32_t band, int32_t gap, int32_t x_to, int3
 
 static void draw_logo_small(int32_t x, int32_t y)   /* "OBERVAVE" in FONT_S with the bands through the lower half */
 {
-    cv_text(x, y, &FONT_S, "OBERVAVE", C_CREAM);
+    cv_text(x, y, &FONT_S, "JPAD", C_CREAM);
     cv_stripes(y + 10, 2, 0, 0, 1);
 }
 
@@ -158,7 +158,7 @@ static void ui_header(uint32_t prog, const uint8_t *name, uint32_t edited, const
     n[PATCH_NAME + 1] = 0;
     cv_text(54, 4, &FONT_S, n, C_CREAM);
     cv_text(54, 22, &FONT_S, tags, C_DIMT);
-    draw_logo_small(240 - 4 - text_w(&FONT_S, "OBERVAVE"), 4);
+    draw_logo_small(240 - 4 - text_w(&FONT_S, "JPAD"), 4);
     cv_rect(0, 42, 240, 1, C_RULE);
     cv_blit(0, 0);
 }
@@ -286,7 +286,7 @@ static void splash_frame(uint32_t fade, int32_t x_to, uint32_t sub)
         if (++x == SPLASH_W) { x = 0; y++; }
     }
     if (sub) {                                      /* the line under the logo, as in assets/logo.png, in two rows */
-        const char *t1 = "8-VOICE ANALOG POLY", *t2 = "M-VAVE FM-1";
+        const char *t1 = "PADS + DRONE", *t2 = "M-VAVE FM-1";
         uint16_t c = sub >= 256u ? C_AMBER : blend565(C_PANEL, C_AMBER, sub);
         cv_text((240 - text_w(&FONT_S, t1)) / 2, SPLASH_H + 14, &FONT_S, t1, c);
         cv_text((240 - text_w(&FONT_S, t2)) / 2, SPLASH_H + 28, &FONT_S, t2, c);

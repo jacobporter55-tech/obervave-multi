@@ -73,7 +73,7 @@ static void fm1_led_key_glow(uint32_t id, int on)   /* as fm1_led_key, the dim l
 #include "bootguard.h"
 
 #ifndef APP_NAME
-#define APP_NAME "OBERVAVE"
+#define APP_NAME "JPAD"
 #endif
 #ifndef FELUCCA_ID
 #if BOARD_SMK37

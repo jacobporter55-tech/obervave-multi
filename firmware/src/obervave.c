@@ -1028,6 +1028,7 @@ static void app_main(void)
         }
     }
     if (set.route_magic != ROUTE_MAGIC) route_defaults();
+    set.midi_ch = MIDI_LAYER;                   /* JPad: always LAYER (the pads, the drone, the three pages) */
     {
         uint32_t n;
         for (n = 0; n < NPART; n++) { if (set.psrc[n] > SRC_KEYS) set.psrc[n] = SRC_OFF; set.platch[n] = set.platch[n] ? 1u : 0u; }
@@ -1282,7 +1283,7 @@ static void app_main(void)
             if (page == PG_GLOBAL && !layer && !SMK_PAD_HELD) {   /* (a held layer has the knobs, on every page) */
                 if (k == 0) { set.tempo = (uint8_t)clampi(set.tempo + e, 40, 240); ctl_tempo = set.tempo; }
                 else if (k == 1) set.click = (uint8_t)clampi((int32_t)(set.click % NCLICK) + (e > 0 ? 1 : -1), 0, NCLICK - 1);
-                else if (k == 2) { ctl_panic = 1; latch_drop_all(); set.midi_ch = (uint8_t)clampi(set.midi_ch + (e > 0 ? 1 : -1), 0, MIDI_LAYER); route_apply(); }
+                else if (k == 2) ;                      /* JPad: the MIDI mode stays LAYER (channels: the ROUTING page) */
                 else { set.tune = (int8_t)clampi(set.tune + e, -50, 50); ctl_tune8 = set.tune * 256 / 100; }
                 set_dirty = 1; set_t = fm1_ms;
             } else if (page == PG_PARTS && !layer && !SMK_PAD_HELD) {
