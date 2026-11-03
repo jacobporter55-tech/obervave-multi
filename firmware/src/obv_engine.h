@@ -692,6 +692,7 @@ static void engine_audio(int32_t *out, uint32_t n)
         any_d |= parts[p].v[P_DLY_MIX];
         any_r |= parts[p].v[P_REV_MIX];
     }
+    for (v = 0, drone_on = 0; v < NV; v++) if (vc[v].part == 2u && vc[v].gate) drone_on = 1;
     fx_block(&parts[2], ctl_ext_quarter ? ctl_ext_quarter : 60u * FS / clampi(ctl_tempo, 40, 240), any_c, any_d, any_r);
     for (i = 0; i < n; i++) bus_c[i] = bus_d[i] = bus_r[i] = 0;
     for (b = 0; b < n; b += CTL) {

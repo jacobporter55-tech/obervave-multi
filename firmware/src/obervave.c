@@ -129,8 +129,11 @@ static uint8_t cc_map[128];                     /* MIDI CC -> parameter + 1, 0 =
 static uint32_t mix_keep;                       /* 1 once the parts are loaded at start */
 static void layer_tame(patch_t *p)              /* JPad: a layer is low-pass, and its filter envelope leaves CUTOFF in charge */
 {
+    int32_t env = p->v[P_FENV_AMT], over = env - (64 + 30);
     if (p->v[P_FTYPE] != F_LP12 && p->v[P_FTYPE] != F_LP24) p->v[P_FTYPE] = F_LP24;
-    p->v[P_FENV_AMT] = (uint8_t)clampi(p->v[P_FENV_AMT], 64 - 30, 64 + 30);
+    if (over > 0) p->v[P_CUTOFF] = (uint8_t)clampi(p->v[P_CUTOFF] + over + over / 2, 0, 127);   /* the envelope's lost opening */
+    p->v[P_FENV_AMT] = (uint8_t)clampi(env, 64 - 30, 64 + 30);
+    if (p->v[P_CUTOFF] < 40u) p->v[P_CUTOFF] = 40u;           /* never shut: a pad that cannot be heard reads as broken */
 }
 static void keep_mix(patch_t *p, const patch_t *old)   /* a new preset keeps the layer's level and the shimmer's settings */
 {

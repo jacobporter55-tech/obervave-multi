@@ -18,6 +18,9 @@
 #ifndef SH_TONE
 #define SH_TONE 150
 #endif
+#ifndef SH_RELEASE
+#define SH_RELEASE 23000                        /* 0.70: the hall's decay once the drone is let go */
+#endif
 #ifndef SH_DAMP
 #define SH_DAMP 29000
 #endif
@@ -44,6 +47,7 @@
 typedef struct { int16_t *b; uint32_t len, w; } line_t;   /* w: where the next sample goes */
 static int16_t fx_mem[FX_MEM_N] __attribute__((section(".pool")));
 static uint32_t fx_used;
+static uint32_t drone_on;                       /* a drone (part 3) note is held: the shimmer hall rings on (obv_engine.h) */
 
 static inline int32_t sat16(int32_t v) { return v > 32767 ? 32767 : v < -32767 ? -32767 : v; }
 static void line_init(line_t *l, uint32_t len) { l->b = fx_mem + fx_used; l->len = len; l->w = 0; fx_used += len; }
@@ -123,6 +127,10 @@ static void fx_block(const patch_t *p, uint32_t quarter, uint32_t any_c, uint32_
     t = p->v[P_DLY_TONE]; sh_tone_k = clampi(((t * t) >> 6) + 6, 6, 256);   /* TONE: dark .. bright octave */
     d = p->v[P_REV_SIZE]; rev_decay = 20000 + ((d * d * 11600) >> 14);   /* DECAY: 0.61 .. 0.96 (about 2 s .. 30 s) */
     rev_damp_k = SH_DAMP;                       /* the one-pole's k at the half rate */
+    if (!drone_on) {                            /* the drone let go: the hall lets go too (gone in ~3 s, no more bloom) */
+        if (rev_decay > SH_RELEASE) rev_decay = SH_RELEASE;
+        sh_fb = 0;
+    }
     if (REV_DIV == 1u) {                        /* the same corner at the full rate: k' = 1 - sqrt(1 - k) */
         uint32_t x = (uint32_t)(32768 - rev_damp_k) << 15, r = 0, bit = 1u << 15;
         for (; bit; bit >>= 1)
