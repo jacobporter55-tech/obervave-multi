@@ -41,7 +41,18 @@ static struct {
     /* multitimbral (appended: an older settings sector loads without these and keeps its programs) */
     uint8_t pprog[NPART];                       /* each part's program */
     uint8_t trk_part[2], focus, multi_pad;      /* the sequencer tracks' parts; the panel's part */
+    /* LAYER routing (appended again: a Multi settings sector loads without these) */
+    uint8_t psrc[NPART];                        /* each part's source: SRC_OFF, MIDI channel 1..16, SRC_KEYS */
+    uint8_t platch[NPART];                      /* a KEYS part: 1 = a key tap starts its note, the next tap stops it */
+    uint8_t route_magic;                        /* ROUTE_MAGIC once the two above are set */
 } set;
+#define SET_MULTI_SIZE ((uint32_t)((uint8_t *)&set.psrc - (uint8_t *)&set))   /* OberVave Multi's settings */
+#define SRC_OFF 0u
+#define SRC_KEYS 17u
+#define ROUTE_MAGIC 0xA7u
+#define SRC_POS(s) ((s) == SRC_KEYS ? 0u : (uint32_t)(s) + 1u)   /* the SOURCE knob, left to right: KEYS, OFF, CH 1 .. 16 */
+#define SRC_AT(k) ((k) == 0 ? SRC_KEYS : (uint32_t)(k) - 1u)
+#define MIDI_LAYER 18u                          /* GLOBAL MIDI: every part listens where its ROUTING page says */
 #define SET_OLD_SIZE ((uint32_t)((uint8_t *)&set.pprog - (uint8_t *)&set))   /* 1.2's settings: up to the programs */
 static uint32_t set_dirty, set_t;
 
@@ -136,9 +147,69 @@ static void load_program_part(uint32_t part, uint32_t n)   /* a program change o
     set.pprog[part] = (uint8_t)n;
     part_ed[part] = 0;
 }
+/* LAYER: the notes a latched KEYS part holds (a tap starts one, the next tap stops it) */
+static uint32_t latch_bits[NPART][4];
+static int latch_has(uint32_t p, uint32_t n) { return latch_bits[p][n >> 5 & 3u] >> (n & 31u) & 1u; }
+static void latch_drop(uint32_t p)              /* forget them (their voices are let go elsewhere, or now) */
+{
+    uint32_t n;
+    for (n = 0; n < 128u; n++)
+        if (latch_has(p, n)) note_event_p(p == focus ? FOCUS : p, 0, n, 0);
+    latch_bits[p][0] = latch_bits[p][1] = latch_bits[p][2] = latch_bits[p][3] = 0;
+}
+static void latch_drop_all(void) { uint32_t p; for (p = 0; p < NPART; p++) latch_drop(p); }
+static void route_apply(void)                   /* the engine's view: the latched KEYS parts keep their voices */
+{
+    uint32_t p, keep = 0;
+    if (set.midi_ch == MIDI_LAYER)
+        for (p = 0; p < NPART; p++) if (set.psrc[p] == SRC_KEYS && set.platch[p]) keep |= 1u << p;
+    for (p = 0; p < NPART; p++) if (!(keep >> p & 1u) && (latch_bits[p][0] | latch_bits[p][1] | latch_bits[p][2] | latch_bits[p][3])) latch_drop(p);
+    ctl_keep = keep;
+}
+static void route_defaults(void)                /* pads: parts 1 + 2 on channel 1; drone: part 3 on the keys, latched */
+{
+    uint32_t p;
+    for (p = 0; p < NPART; p++) { set.psrc[p] = SRC_OFF; set.platch[p] = 0; }
+    set.psrc[0] = set.psrc[1] = 1;
+    set.psrc[2] = SRC_KEYS; set.platch[2] = 1;
+    set.route_magic = ROUTE_MAGIC;
+    set.midi_ch = MIDI_LAYER;
+}
+static uint32_t keys_parts(void)                /* LAYER: the parts the onboard keys play (bit p), 0 = the panel's */
+{
+    uint32_t p, m = 0;
+    if (set.midi_ch != MIDI_LAYER) return 0;
+    for (p = 0; p < NPART; p++) if (set.psrc[p] == SRC_KEYS) m |= 1u << p;
+    return m;
+}
+/* LAYER: a key (onboard or MIDI) for part p; latched KEYS parts toggle on the press and ignore the release */
+static void layer_note(uint32_t p, uint32_t on, uint32_t note, uint32_t vel, uint32_t from_keys)
+{
+    uint32_t tgt = p == focus ? FOCUS : p, w = note >> 5 & 3u, b = 1u << (note & 31u);
+    note &= 127u;
+    if (from_keys && set.platch[p]) {
+        if (!on) return;
+        if (latch_bits[p][w] & b) { latch_bits[p][w] &= ~b; note_event_p(tgt, 0, note, 0); }
+        else { latch_bits[p][w] |= b; note_event_p(tgt, 1, note, vel); }
+        return;
+    }
+    note_event_p(tgt, on, note, on ? vel : 0);
+}
+/* LAYER's home page and CC 102-105: the three layers' cutoffs (parts 1-3) and the drone's (part 3's) shimmer send */
+#define HOME_CC0 102u
+static void set_param(uint32_t p, int32_t v);
+static void set_param_part(uint32_t part, uint32_t p, int32_t v);
+static const uint8_t HOME_PART[4] = {0, 1, 2, 2}, HOME_PARAM[4] = {P_CUTOFF, P_CUTOFF, P_CUTOFF, P_DLY_MIX};
+static void home_set(uint32_t i, int32_t v)
+{
+    uint32_t p = HOME_PART[i & 3u], q = HOME_PARAM[i & 3u];
+    v = clampi(v, 0, PDEF[q].max);
+    if (p == focus) set_param(q, v); else set_param_part(p, q, v);
+}
 static void focus_set(uint32_t n)               /* the panel moves to part n (the ISR lets the old part's keys go) */
 {
     if (n >= NPART || n == focus) return;
+    latch_drop(focus);                          /* (the engine lets the old part's keys go: its latched notes too) */
     part_ed[focus] = edited;
     focus = n;
     prog = set.pprog[n] % NPROG;
@@ -155,12 +226,65 @@ static uint32_t midi_part(uint32_t ch)
     return 255u;
 }
 
-static void load_pattern(uint32_t n)            /* the saved one, else the factory's */
+/* ---- songs: each pattern slot (one flash sector) also keeps a song: every part's sound, the routing and the tempo.
+ * Recalling slot n gives its pattern and, if a song was saved there, its sounds too. */
+#define SONG_MAGIC 0x31474E53u                  /* "SNG1" */
+#define SONG_CH 16u                             /* a program change on MIDI channel 16 recalls song 1-8 (0-7) */
+typedef struct {
+    uint32_t magic;
+    patch_t part[NPART];
+    uint8_t psrc[NPART], platch[NPART], pprog[NPART], tempo, focus, pad[2];
+} song_t;
+typedef struct { pattern_t pat; song_t song; } slot_t;
+static slot_t slot_io __attribute__((section(".pool")));   /* the sector's image, loading or saving */
+static song_t song_cur __attribute__((section(".pool")));  /* the song kept in the current slot (magic 0: none) */
+static uint32_t song_loaded;                    /* 1: the sounds now came from the current slot's song */
+
+static void song_apply(const song_t *g)         /* the sounds, routing and tempo of a song, now */
+{
+    uint32_t n;
+    latch_drop_all();
+    for (n = 0; n < NPART; n++) {
+        parts[n] = g->part[n];
+        part_ed[n] = 0;
+        set.pprog[n] = g->pprog[n];
+        set.psrc[n] = g->psrc[n] <= SRC_KEYS ? g->psrc[n] : SRC_OFF;
+        set.platch[n] = g->platch[n] ? 1u : 0u;
+        pt[n].cut_sm = parts[n].v[P_CUTOFF] << 8; pt[n].reso_sm = parts[n].v[P_RESO] << 8;
+    }
+    if (g->focus < NPART) { focus = g->focus; set.focus = g->focus; }
+    prog = set.pprog[focus] % NPROG;
+    edited = 0;
+    if (g->tempo >= 40u && g->tempo <= 240u) { set.tempo = g->tempo; ctl_tempo = set.tempo; }
+    route_apply();
+}
+static void song_take(song_t *g)                /* now, as a song */
+{
+    uint32_t n;
+    g->magic = SONG_MAGIC;
+    for (n = 0; n < NPART; n++) { g->part[n] = parts[n]; g->psrc[n] = set.psrc[n]; g->platch[n] = set.platch[n]; g->pprog[n] = set.pprog[n]; }
+    g->tempo = set.tempo;
+    g->focus = (uint8_t)focus;
+    g->pad[0] = g->pad[1] = 0;
+}
+static int slot_write(uint32_t n)               /* the pattern now and the slot's song (song_cur) into sector n */
+{
+    slot_io.pat = pat;
+    slot_io.song = song_cur;
+    return blob_save(n % NPAT, &slot_io, sizeof slot_io);
+}
+
+static void load_pattern(uint32_t n)            /* the saved one, else the factory's; its song, if it has one */
 {
     pattern_t *p = &pat;
     n %= NPAT;
     ctl_panic = 1;                              /* (what the old one held lets go) */
-    if (blob_load(n, p, sizeof *p) || p->magic != PAT_MAGIC) pat_factory(n, p);
+    song_loaded = 0;
+    song_cur.magic = 0;
+    if (!blob_load(n, &slot_io, sizeof slot_io) && slot_io.pat.magic == PAT_MAGIC) {
+        *p = slot_io.pat;
+        if (slot_io.song.magic == SONG_MAGIC) { song_cur = slot_io.song; song_apply(&song_cur); song_loaded = 1; }
+    } else if (blob_load(n, p, sizeof *p) || p->magic != PAT_MAGIC) pat_factory(n, p);   /* (OberVave's: a pattern only) */
     set.pat = (uint8_t)n;
     seq_cur[0] = seq_cur[1] = seq_pg[0] = seq_pg[1] = 0;
     pat_edited = 0;
@@ -357,6 +481,20 @@ static void fmt_u(char *s, uint32_t v)          /* decimal, no leading zeros */
 static uint32_t slen(const char *s) { uint32_t n = 0; while (s[n]) n++; return n; }
 static void scat(char *d, const char *s) { d += slen(d); while ((*d++ = *s++)) ; }
 
+static void song_go(uint32_t n, uint32_t *dirty_hdr)   /* recall slot n: its pattern, and its song if it has one */
+{
+    static char msg[16];
+    uint32_t run = ctl_seq_run;
+    load_pattern(n);
+    if (run) { ctl_seq_restart = 1; ctl_seq_run = 1; }   /* (playing: the new one from the top) */
+    set_dirty = 1; set_t = fm1_ms;
+    msg[0] = 0; scat(msg, song_loaded ? "SONG " : "PATTERN "); fmt_u(msg + slen(msg), n + 1u);
+    if (!song_loaded) scat(msg, " (NO SONG)");
+    say(msg);
+    *dirty_hdr = 1;
+}
+
+
 static void fmt_ms(char *s, uint32_t ms_x10)
 {
     char t[4];
@@ -487,7 +625,7 @@ static void seq_knob(knob_view_t *k, uint32_t i)   /* the SEQ layer's knobs: the
 static void layer_knob(knob_view_t *k, uint32_t i)
 {
     static const char *const LE[4] = {"SHIFT", "LENGTH", "TRANSP", ""};
-    static const int8_t FXP[4] = {P_CHO_MIX, P_DLY_MIX, P_REV_MIX, P_DLY_TIME};
+    static const int8_t FXP[4] = {P_CHO_MIX, P_DLY_MIX, P_REV_MIX, P_DLY_FB};
     k->present = 0;
     if (layer == L_EDIT && i < 3u) {
         k->present = 1; k->label = LE[i]; k->v = 0; k->max = 1;
@@ -516,7 +654,7 @@ static void draw_page(void)
             k[i].present = 1;
             if (i == 0) { fmt_u(k[i].value, set.tempo); k[i].v = set.tempo - 40; k[i].max = 200; }
             else if (i == 1) { scat(k[i].value, CLICK_NAME[set.click % NCLICK]); k[i].v = set.click % NCLICK; k[i].max = NCLICK - 1; }
-            else if (i == 2) { if (set.midi_ch == 0u) scat(k[i].value, "MULTI"); else if (set.midi_ch == MIDI_OMNI) scat(k[i].value, "OMNI"); else fmt_u(k[i].value, set.midi_ch); k[i].v = set.midi_ch; k[i].max = MIDI_OMNI; }
+            else if (i == 2) { if (set.midi_ch == 0u) scat(k[i].value, "MULTI"); else if (set.midi_ch == MIDI_OMNI) scat(k[i].value, "OMNI"); else if (set.midi_ch == MIDI_LAYER) scat(k[i].value, "LAYER"); else fmt_u(k[i].value, set.midi_ch); k[i].v = set.midi_ch; k[i].max = MIDI_LAYER; }
             else { scat(k[i].value, set.tune < 0 ? "-" : "+"); fmt_u(k[i].value + 1, (uint32_t)(set.tune < 0 ? -set.tune : set.tune)); scat(k[i].value, "c"); k[i].v = set.tune + 50; k[i].max = 100; k[i].bip = 1; }
         } else if (page == PG_PARTS && !layer && !SMK_PAD_HELD) {
             static const char *const PL[4] = {"PART", "TRACK A", "TRACK B", "VOLUME"};
@@ -524,6 +662,28 @@ static void draw_page(void)
             k[i].present = 1;
             if (i == 0) { scat(k[i].value, "P"); fmt_u(k[i].value + 1, focus + 1u); k[i].v = focus; k[i].max = NPART - 1u; }
             else if (i < 3) { scat(k[i].value, "P"); fmt_u(k[i].value + 1, set.trk_part[i - 1u] + 1u); k[i].v = set.trk_part[i - 1u]; k[i].max = NPART - 1u; }
+            else { fmt_u(k[i].value, live.v[P_VOLUME]); k[i].v = live.v[P_VOLUME]; k[i].max = 127; }
+        } else if (page == PG_PERFORM && set.midi_ch == MIDI_LAYER && !layer && !SMK_PAD_HELD) {
+            static const char *const HL[4] = {"CUT P1", "CUT P2", "CUT P3", "SHIMMER"};
+            uint32_t q = HOME_PARAM[i];
+            int32_t v = parts[HOME_PART[i]].v[q];
+            k[i].label = HL[i];
+            k[i].present = 1;
+            k[i].v = v; k[i].max = PDEF[q].max;
+            param_value(k[i].value, q, (uint32_t)v);
+        } else if (page == PG_ROUTE && !layer && !SMK_PAD_HELD) {
+            static const char *const RL[4] = {"PART", "SOURCE", "LATCH", "VOLUME"};
+            uint32_t sr = set.psrc[focus];
+            k[i].label = RL[i];
+            k[i].present = 1;
+            if (i == 0) { scat(k[i].value, "P"); fmt_u(k[i].value + 1, focus + 1u); k[i].v = focus; k[i].max = NPART - 1u; }
+            else if (i == 1) {
+                if (set.midi_ch != MIDI_LAYER) scat(k[i].value, "NOT LAYER");
+                else if (sr == SRC_OFF) scat(k[i].value, "OFF");
+                else if (sr == SRC_KEYS) scat(k[i].value, "KEYS");
+                else { scat(k[i].value, "CH "); fmt_u(k[i].value + 3, sr); }
+                k[i].v = SRC_POS(sr); k[i].max = SRC_KEYS;
+            } else if (i == 2) { scat(k[i].value, sr != SRC_KEYS ? "-" : set.platch[focus] ? "ON" : "OFF"); k[i].v = set.platch[focus]; k[i].max = 1; }
             else { fmt_u(k[i].value, live.v[P_VOLUME]); k[i].v = live.v[P_VOLUME]; k[i].max = 127; }
         } else if (layer == L_EDIT || layer == L_FX || layer == L_GLO || layer == L_SAVE) {
             layer_knob(&k[i], i);
@@ -586,7 +746,7 @@ static void draw_hints(void)
         {"HOLD SEQ: KEYS ARE STEPS", "HOLD " NM_EDIT ": KEYS ERASE"},
 #endif
         {NM_ALGO ": TRACK A / B", NM_SELECT ": TEMPO"},
-        {"PLAY: START  REC: RECORD LIVE", "REC HELD=CLEAR " NM_EDIT "+KEY=ERASE"}};
+        {"PLAY: START  REC: NEXT SONG", "REC HELD=SAVE  " NM_EDIT "+KEY=ERASE"}};
     static char ring[24];
     uint32_t r = (fm1_ms / 3500u) % 3u, key, held = rec_down ? fm1_ms - rec_down_t : 0u;
     int toasting = toast && fm1_ms - toast_t < 1500u;
@@ -596,7 +756,7 @@ static void draw_hints(void)
         scat(ring, "[");
         for (k = 0; k < 12u; k++) scat(ring, k < f ? "#" : "-");
         scat(ring, "]");
-        ui_hints(seq_trk ? "KEEP HOLDING: CLEAR TRACK B" : "KEEP HOLDING: CLEAR TRACK A", ring, C_RED);
+        ui_hints("KEEP HOLDING: SAVE THE SONG", ring, C_RED);
         hints_key = 0xFFFFFFFEu;
         return;
     }
@@ -612,7 +772,7 @@ static void draw_hints(void)
     else if (layer == L_EDIT) ui_hints("KEY: ERASE THAT NOTE", "OCT-: UNDO  OCT+: REDO", C_AMBER);
     else if (layer == L_GLO) ui_hints("KEY 1 2: MUTE A B  5 6: SOLO", "9-14: PART 1-6  G5: TAP", C_AMBER);
     else if (layer == L_SAVE) ui_hints("WHITE KEYS 1-8: PATTERN 1-8", "+ " NM_SELBTN " PRESSED: NEW SOUND", C_AMBER);
-    else if (layer == L_FX) ui_hints("KNOBS: CHORUS DELAY REVERB", "AND THE DELAY'S TIME", C_AMBER);
+    else if (layer == L_FX) ui_hints("KNOBS: CHORUS SHIMMER REVERB", "AND THE SHIMMER'S BLOOM", C_AMBER);
     else ui_hints(ROT[r][0], ROT[r][1], C_CREAM);
 }
 
@@ -834,20 +994,32 @@ static void app_main(void)
     if (settings_load(&set, sizeof set) || set.version != SET_VERSION) {
         uint32_t n;
         for (n = 0; n < sizeof set; n++) ((uint8_t *)&set)[n] = 0;
-        if (!settings_load(&set, SET_OLD_SIZE) && set.version == SET_VERSION) {   /* 1.2's settings: keep them, add the parts */
+        if (!settings_load(&set, SET_MULTI_SIZE) && set.version == SET_VERSION) {   /* Multi's: keep them, add LAYER */
+            route_defaults();
+        } else if (!settings_load(&set, SET_OLD_SIZE) && set.version == SET_VERSION) {   /* 1.2's settings: keep them, add the parts */
             for (n = 0; n < NPART; n++) set.pprog[n] = (uint8_t)(n ? n : set.prog);
+            set.trk_part[0] = set.trk_part[1] = 0;
+            set.focus = 0;
+            route_defaults();
         } else {
             for (n = 0; n < sizeof set; n++) ((uint8_t *)&set)[n] = 0;
             set.version = SET_VERSION;
             set.tempo = 120;
             for (n = 0; n < NPART; n++) set.pprog[n] = (uint8_t)n;
+            set.pprog[0] = 8; set.pprog[1] = 14; set.pprog[2] = 27;   /* SWEEP PAD + HOLLOW PAD on ch 1, VINTAGE PD the drone */
+            set.trk_part[0] = set.trk_part[1] = 0;
+            set.focus = 0;
+            route_defaults();
         }
-        set.trk_part[0] = set.trk_part[1] = 0;
-        set.focus = 0;
+    }
+    if (set.route_magic != ROUTE_MAGIC) route_defaults();
+    {
+        uint32_t n;
+        for (n = 0; n < NPART; n++) { if (set.psrc[n] > SRC_KEYS) set.psrc[n] = SRC_OFF; set.platch[n] = set.platch[n] ? 1u : 0u; }
     }
     if (set.tempo < 40u || set.tempo > 240u) set.tempo = 120;
     if (set.oct < -2 || set.oct > 2) set.oct = 0;
-    if (set.midi_ch > MIDI_OMNI) set.midi_ch = 0;
+    if (set.midi_ch > MIDI_LAYER) set.midi_ch = 0;
     ctl_tempo = set.tempo;
     ctl_tune8 = set.tune * 256 / 100;
     {   /* every part's program, then the panel on the saved part */
@@ -861,6 +1033,7 @@ static void app_main(void)
     }
     load_pattern(set.pat);
     ctl_panic = 0;
+    route_apply();
 
     ui_splash();
     scope_state = 1;
@@ -892,9 +1065,14 @@ static void app_main(void)
                     layer_used = 1;
                     if (KEY_STEP[k] >= 0 && KEY_STEP[k] < (int32_t)NPAT) {
                         if ((uint32_t)KEY_STEP[k] != set.pat) { load_pattern((uint32_t)KEY_STEP[k]); set_dirty = 1; set_t = fm1_ms; }
-                        msg[0] = 0; scat(msg, "PATTERN "); fmt_u(msg + slen(msg), set.pat + 1u);
+                        msg[0] = 0; scat(msg, song_loaded ? "SONG " : "PATTERN "); fmt_u(msg + slen(msg), set.pat + 1u);
                         say(msg);
                     }
+                } else if (keys_parts()) {      /* LAYER: the keys play their parts (a latched drone toggles) */
+                    uint32_t m = keys_parts(), p;
+                    key_step[k] = 5u;
+                    for (p = 0; p < NPART; p++) if (m >> p & 1u) layer_note(p, 1, held_key[k], KEY_VEL(k), 1);
+                    midi_send(0x90, held_key[k], KEY_VEL(k));
                 } else {
                     note_event(1, held_key[k], KEY_VEL(k)); midi_send(0x90, held_key[k], KEY_VEL(k));
                     if (!live.v[P_ARP_MODE]) rec_note(1, held_key[k], KEY_VEL(k));
@@ -905,7 +1083,11 @@ static void app_main(void)
             if (up >> k & 1u) {
                 if (key_step[k] == 2u) erase_on[(uint32_t)clampi((int32_t)held_key[k] - pat.trk[seq_trk].transp, 1, 127)] = 0;
                 else if (key_step[k] == 1u) seq_key_up(k);
-                else if (key_step[k] == 0u) {
+                else if (key_step[k] == 5u) {
+                    uint32_t m = keys_parts(), p;
+                    for (p = 0; p < NPART; p++) if (m >> p & 1u) layer_note(p, 0, held_key[k], 0, 1);
+                    midi_send(0x80, held_key[k], 0);
+                } else if (key_step[k] == 0u) {
                     note_event(0, held_key[k], 0); midi_send(0x80, held_key[k], 0);
                     if (!live.v[P_ARP_MODE]) rec_note(0, held_key[k], 0);
                     if (notes_down) notes_down--;
@@ -950,7 +1132,7 @@ static void app_main(void)
                         if (LL[k] == L_SEQ) np = is_seq_page(page) ? seq_back : (seq_back = page, PG_SEQ);
                         else if (LL[k] == L_EDIT) np = cycle_page(PG_OSC1, 5);
                         else if (LL[k] == L_FX) np = cycle_page(PG_CHORUS, 3);
-                        else if (LL[k] == L_GLO) np = page == PG_GLOBAL ? PG_VOICE : page == PG_VOICE ? PG_OUTPUT : page == PG_OUTPUT ? PG_PARTS : PG_GLOBAL;
+                        else if (LL[k] == L_GLO) np = page == PG_GLOBAL ? PG_VOICE : page == PG_VOICE ? PG_OUTPUT : page == PG_OUTPUT ? PG_PARTS : page == PG_PARTS ? PG_ROUTE : PG_GLOBAL;
                         else if (save_armed) {      /* SAVE tapped twice: the program, or on the sequencer page the pattern */
                             if (is_seq_page(page)) pat_dirty = 1;
                             else { set.user[prog] = live; set.used |= 1u << prog; edited = 0; set_dirty = 1; set_t = fm1_ms; }
@@ -1013,25 +1195,26 @@ static void app_main(void)
             }
             dirty_tags = dirty_steps = 1;
         }
-        if (b & (1u << BTN_REC)) { rec_down = 1; rec_down_t = fm1_ms; }   /* REC acts when let go; held 2 s it clears the track */
+        /* REC is the SONG button (no recording in this build): a tap = the next song, held 2 s = save the song here */
+        if (b & (1u << BTN_REC)) { rec_down = 1; rec_down_t = fm1_ms; }
         if (rec_down && fm1_ms - rec_down_t > 2000u) {
-            uint32_t n;
-            undo_save();
-            for (n = 0; n < pat.trk[seq_trk].len; n++) step_clear(seq_step(seq_trk, n));
-            pat_edited = 1;
+            static char msg[16];
+            song_take(&song_cur);
+            song_loaded = 1;
+            for (k = 0; k < NPART; k++) part_ed[k] = 0;
+            edited = 0;
+            ctl_seq_run = 0;
+            slot_write(set.pat);                /* now, even with a drone sounding: the erase is a short gap in the sound */
+            pat_dirty = pat_edited = 0;
+            set_dirty = 1; set_t = fm1_ms;
             rec_down = 0;
-            if (rec == REC_ON) rec = REC_OFF;
-            say(seq_trk ? "TRACK B CLEARED" : "TRACK A CLEARED");
-            dirty_tags = dirty_steps = dirty_page = 1;
+            msg[0] = 0; scat(msg, "SONG "); fmt_u(msg + slen(msg), set.pat + 1u); scat(msg, " SAVED");
+            say(msg);
+            dirty_hdr = dirty_tags = dirty_steps = dirty_page = 1;
             leds_q = 0xFFFFFFFFu;
         }
         if (rel & (1u << BTN_REC) && rec_down) {
-            if (fm1_ms - rec_down_t < 700u) {   /* a press: playing, record now / stop recording; stopped, arm */
-                if (rec) rec = REC_OFF;
-                else if (ctl_seq_run) { rec = REC_ON; undo_save(); }
-                else rec = REC_READY;
-                memset(rec_open, 0, sizeof rec_open);
-            }
+            if (fm1_ms - rec_down_t < 700u) song_go((set.pat + 1u) % NPAT, &dirty_hdr);
             rec_down = 0;
             hints_key = 0xFFFFFFFFu;
             leds_q = 0xFFFFFFFFu;
@@ -1076,7 +1259,7 @@ static void app_main(void)
             if (page == PG_GLOBAL && !layer && !SMK_PAD_HELD) {   /* (a held layer has the knobs, on every page) */
                 if (k == 0) { set.tempo = (uint8_t)clampi(set.tempo + e, 40, 240); ctl_tempo = set.tempo; }
                 else if (k == 1) set.click = (uint8_t)clampi((int32_t)(set.click % NCLICK) + (e > 0 ? 1 : -1), 0, NCLICK - 1);
-                else if (k == 2) set.midi_ch = (uint8_t)clampi(set.midi_ch + (e > 0 ? 1 : -1), 0, MIDI_OMNI);
+                else if (k == 2) { ctl_panic = 1; latch_drop_all(); set.midi_ch = (uint8_t)clampi(set.midi_ch + (e > 0 ? 1 : -1), 0, MIDI_LAYER); route_apply(); }
                 else { set.tune = (int8_t)clampi(set.tune + e, -50, 50); ctl_tune8 = set.tune * 256 / 100; }
                 set_dirty = 1; set_t = fm1_ms;
             } else if (page == PG_PARTS && !layer && !SMK_PAD_HELD) {
@@ -1086,13 +1269,27 @@ static void app_main(void)
                 else set_param(P_VOLUME, (int32_t)live.v[P_VOLUME] + e);
                 set_dirty = 1; set_t = fm1_ms;
                 dirty_hdr = dirty_tags = 1;
+            } else if (page == PG_PERFORM && set.midi_ch == MIDI_LAYER && !layer && !SMK_PAD_HELD) {
+                home_set(k, (int32_t)parts[HOME_PART[k]].v[HOME_PARAM[k]] + e * 2);
+                dirty_hdr = dirty_tags = 1;
+            } else if (page == PG_ROUTE && !layer && !SMK_PAD_HELD) {
+                int32_t d = e > 0 ? 1 : -1;
+                if (k == 0) focus_set((uint32_t)clampi((int32_t)focus + d, 0, NPART - 1));
+                else if (k == 1 && set.midi_ch == MIDI_LAYER) {
+                    latch_drop(focus);
+                    set.psrc[focus] = (uint8_t)SRC_AT(clampi((int32_t)SRC_POS(set.psrc[focus]) + d, 0, SRC_KEYS));
+                    route_apply();
+                } else if (k == 2) { set.platch[focus] = d > 0; route_apply(); }
+                else if (k == 3) set_param(P_VOLUME, (int32_t)live.v[P_VOLUME] + e);
+                set_dirty = 1; set_t = fm1_ms;
+                dirty_hdr = dirty_tags = 1;
             } else if (layer == L_EDIT) {
                 edit_turn(k, e);
                 dirty_steps = 1;
             } else if (layer == L_FX) {
-                static const int8_t FXP[4] = {P_CHO_MIX, P_DLY_MIX, P_REV_MIX, P_DLY_TIME};
+                static const int8_t FXP[4] = {P_CHO_MIX, P_DLY_MIX, P_REV_MIX, P_DLY_FB};
                 layer_used = 1;
-                set_param((uint32_t)FXP[k], (int32_t)live.v[FXP[k]] + (FXP[k] == P_DLY_TIME ? (e > 0 ? 1 : -1) : e * 2));
+                set_param((uint32_t)FXP[k], (int32_t)live.v[FXP[k]] + e * 2);
                 dirty_tags = 1;
             } else if (layer == L_GLO || layer == L_SAVE) {
                 ;
@@ -1134,6 +1331,40 @@ static void app_main(void)
             }
             if (st == 0xFCu) { ctl_seq_run = 0; dirty_tags = dirty_steps = 1; continue; }
             if (st >= 0xF0u) continue;
+            if (kind == 0xC0u && ch == SONG_CH) { song_go(d1 % NPAT, &dirty_hdr); dirty_page = dirty_tags = dirty_steps = 1; continue; }
+            if (set.midi_ch == MIDI_LAYER) {    /* LAYER: every part on this channel takes it (pads layer) */
+                uint32_t p;
+                if (kind == 0xB0u && d1 >= HOME_CC0 && d1 < HOME_CC0 + 4u) {   /* any channel: the home page's knobs */
+                    uint32_t q = HOME_PARAM[d1 - HOME_CC0];
+                    home_set(d1 - HOME_CC0, PDEF[q].max == 127 ? (int32_t)d2 : ((int32_t)d2 * PDEF[q].max + 63) / 127);
+                    dirty_page = 1;
+                    continue;
+                }
+                if (kind == 0xC0u) {            /* one sound a program change: the panel's part if it is here, else the first */
+                    for (p = 0; p < NPART && set.psrc[p] != ch; p++) ;
+                    if (set.psrc[focus] == ch) p = focus;
+                    if (p < NPART) { load_program_part(p, d1); set_dirty = 1; set_t = fm1_ms; dirty_hdr = dirty_page = dirty_tags = 1; }
+                    continue;
+                }
+                for (p = 0; p < NPART; p++) {
+                    if (set.psrc[p] != ch) continue;
+                    if (kind == 0x90u && d2) layer_note(p, 1, d1, d2, 0);
+                    else if (kind == 0x80u || kind == 0x90u) layer_note(p, 0, d1, 0, 0);
+                    else if (kind == 0xE0u) ctl_bend[p] = (int32_t)(d1 | d2 << 7) - 8192;
+                    else if (kind == 0xB0u) {
+                        if (d1 == 7u) ctl_cc7[p] = d2;
+                        else if (d1 == 64u) ctl_sus[p] = d2 >= 64u;
+                        else if (d1 == 120u || d1 == 123u) { ctl_panic = 1; latch_drop_all(); }
+                        else if (name_cc(p, d1, d2)) dirty_hdr = 1;
+                        else if (cc_map[d1]) {
+                            uint32_t q = cc_map[d1] - 1u;
+                            int32_t v = PDEF[q].max == 127 ? (int32_t)d2 : ((int32_t)d2 * PDEF[q].max + 63) / 127;
+                            if (p == focus) { set_param(q, v); dirty_page = dirty_hdr = 1; } else set_param_part(p, q, v);
+                        }
+                    }
+                }
+                continue;
+            }
             {
                 uint32_t part = midi_part(ch);
                 if (part == 255u) continue;
@@ -1249,7 +1480,7 @@ static void app_main(void)
         fm1_led_key(BTN_ENV, page == PG_FENV || page == PG_AENV);
         fm1_led_key(BTN_LFO, page >= PG_LFO && page <= PG_LFO2);
         fm1_led_key(BTN_FX, page >= PG_CHORUS && page <= PG_REVERB);
-        fm1_led_key(BTN_GLO, page >= PG_VOICE && page <= PG_PARTS);
+        fm1_led_key(BTN_GLO, page >= PG_VOICE && page <= PG_ROUTE);
         fm1_led_key(BTN_SAVE, save_armed);
 #if BOARD_SMK37
         smk_leds();                             /* the step pads, FADER BANK, < > */
@@ -1309,7 +1540,7 @@ static void app_main(void)
             set_dirty = 0;
         }
         if (pat_dirty && !ctl_seq_run && engine_quiet()) {
-            blob_save(set.pat, &pat, sizeof pat);
+            slot_write(set.pat);
             pat_dirty = pat_edited = 0;
             dirty_page = 1;
         }

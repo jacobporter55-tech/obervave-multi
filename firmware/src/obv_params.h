@@ -101,9 +101,9 @@ static const pdef_t PDEF[NPARAM] = {
     [P_CHO_DEPTH] = {"DEPTH", 127, 50, K_NUM, 0},
     [P_CHO_MIX] = {"MIX", 127, 0, K_NUM, 0},
     [P_DLY_TIME] = {"TIME", NDDIV - 1, DD_8D, K_DDIV, 0},
-    [P_DLY_FB] = {"FEEDBK", 127, 50, K_NUM, 0},
+    [P_DLY_FB] = {"BLOOM", 127, 50, K_NUM, 0},
     [P_DLY_TONE] = {"TONE", 127, 70, K_NUM, 0},
-    [P_DLY_MIX] = {"MIX", 127, 0, K_NUM, 0},
+    [P_DLY_MIX] = {"SHIMMER", 127, 0, K_NUM, 0},
     [P_REV_SIZE] = {"SIZE", 127, 80, K_NUM, 0},
     [P_REV_DAMP] = {"DAMP", 127, 60, K_NUM, 0},
     [P_REV_PRE] = {"PRE-DLY", 127, 20, K_NUM, 0},
@@ -125,7 +125,7 @@ static const uint8_t DDIV_NUM[NDDIV] = {1, 1, 1, 3, 1, 3, 2}, DDIV_DEN[NDDIV] = 
 /* the pages: four knobs each (-1 = no knob) */
 typedef struct { const char *title; int8_t p[4]; } page_t;
 enum { PG_PERFORM, PG_OSC1, PG_OSC2, PG_OSCMOD, PG_FILTER, PG_FILTER2, PG_FENV, PG_AENV, PG_LFO, PG_LFODEST,
-       PG_LFO2, PG_ARP, PG_CHORUS, PG_DELAY, PG_REVERB, PG_VOICE, PG_OUTPUT, PG_GLOBAL, PG_PARTS,
+       PG_LFO2, PG_ARP, PG_CHORUS, PG_DELAY, PG_REVERB, PG_VOICE, PG_OUTPUT, PG_GLOBAL, PG_PARTS, PG_ROUTE,
        PG_SEQ, NPAGE };                         /* the sequencer's step view (not patch parameters: drawn by hand) */
 static const page_t PAGE[NPAGE] = {
     [PG_PERFORM] = {"PERFORM", {P_CUTOFF, P_RESO, P_FENV_AMT, P_AR}},   /* (ALGORITHM picks the track now, as sloopDX) */
@@ -143,10 +143,11 @@ static const page_t PAGE[NPAGE] = {
     [PG_OUTPUT] = {"OUTPUT", {P_VINTAGE, P_SPREAD, P_BEND, P_VOLUME}},
     [PG_ARP] = {"ARP", {P_ARP_MODE, P_ARP_DIV, P_ARP_OCT, P_ARP_GATE}},
     [PG_CHORUS] = {"CHORUS", {P_CHO_RATE, P_CHO_DEPTH, P_CHO_MIX, -1}},
-    [PG_DELAY] = {"DELAY", {P_DLY_TIME, P_DLY_FB, P_DLY_TONE, P_DLY_MIX}},
+    [PG_DELAY] = {"SHIMMER", {P_DLY_FB, P_DLY_TONE, P_DLY_MIX, -1}}   /* (the delay's page: its time knob is gone) */,
     [PG_REVERB] = {"REVERB", {P_REV_SIZE, P_REV_DAMP, P_REV_PRE, P_REV_MIX}},
     [PG_GLOBAL] = {"GLOBAL", {-1, -1, -1, -1}},   /* tempo, MIDI channel, tune, CPU: globals, drawn by hand */
     [PG_PARTS] = {"PARTS", {-1, -1, -1, -1}},     /* the panel's part, the tracks' parts, its volume: drawn by hand */
+    [PG_ROUTE] = {"ROUTING", {-1, -1, -1, -1}},   /* LAYER mode: the panel part's source (MIDI channel / KEYS), latch */
     [PG_SEQ] = {"SEQUENCER", {-1, -1, -1, -1}},   /* length, note value, swing, transpose; a held step: its own four */
 };
 
@@ -167,5 +168,9 @@ static void patch_from_factory(patch_t *p, const factory_t *f)
     uint32_t i;
     patch_defaults(p);
     while (s[0] != 255u) { p->v[s[0]] = s[1]; s += 2; }
+    if (p->v[P_DLY_MIX]) {                      /* the delay is a shimmer now: its echo level goes to the reverb instead */
+        p->v[P_REV_MIX] = (uint8_t)(p->v[P_REV_MIX] + p->v[P_DLY_MIX] / 2u > 127u ? 127u : p->v[P_REV_MIX] + p->v[P_DLY_MIX] / 2u);
+        p->v[P_DLY_MIX] = 0;
+    }
     for (i = 0; i < PATCH_NAME && f->name[i]; i++) p->v[NPARAM + i] = (uint8_t)f->name[i];
 }

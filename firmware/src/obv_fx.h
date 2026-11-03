@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-only */
-/* The effects after the output stage: a stereo chorus, a ping-pong delay in note values of the tempo, and a
+/* The effects after the output stage: a stereo chorus, a shimmer (an octave-up pitch shifter that feeds the
+ * reverb and is fed back from its tail; it took the delay's place, memory and time), and a
  * plate reverb (J. Dattorro's figure-of-eight tank, 1997). All lines are int16 in one .pool buffer; the
  * signals are Q15 as the output stage leaves them. Integers only.
  * REV_DIV 1: the reverb at the full rate (the sound comes first). 2: at half the rate, if the chip turns out
@@ -8,7 +9,8 @@
 #define REV_DIV 2u
 #endif
 #define RVL(x) ((uint32_t)((x) * 44100u / 29761u / REV_DIV))   /* the paper's 29761 Hz lengths at our rate */
-#define DLY_MAX 32768u                          /* a side of the delay: 743 ms */
+#define SH_N 4096u                              /* the shimmer's line: 93 ms */
+#define SH_W 2048u                              /* a grain: 46 ms, two heads half a grain apart */
 #define CHO_N 1024u
 #define REV_PRE_N (8192u / REV_DIV)             /* up to 120 ms of pre-delay */
 #define RV_IN1 RVL(142)
@@ -25,7 +27,7 @@
 #define RV_D4 RVL(3163)
 #define REV_N (REV_PRE_N + RV_IN1 + RV_IN2 + RV_IN3 + RV_IN4 + RV_AP1 + 16u + RV_D1 + RV_AP2 + RV_D2 + RV_AP3 + 16u + RV_D3 + RV_AP4 + RV_D4)
 #define RV_BW (REV_DIV == 2u ? 24000 : 16700)   /* the input's one-pole: ~5 kHz either way */
-#define FX_MEM_N (CHO_N + 2u * DLY_MAX + REV_N)
+#define FX_MEM_N (CHO_N + SH_N + REV_N)
 
 typedef struct { int16_t *b; uint32_t len, w; } line_t;   /* w: where the next sample goes */
 static int16_t fx_mem[FX_MEM_N] __attribute__((section(".pool")));
@@ -67,16 +69,17 @@ static inline int32_t tri_q(uint32_t ph)        /* a triangle -2048..2047 (so Q8
 }
 
 /* ---- the state */
-static line_t cho, dl, dr, rv_pre, rv_in[4], rv_ap1, rv_d1, rv_ap2, rv_d2, rv_ap3, rv_d3, rv_ap4, rv_d4;
+static line_t cho, shl, rv_pre, rv_in[4], rv_ap1, rv_d1, rv_ap2, rv_d2, rv_ap3, rv_d3, rv_ap4, rv_d4;
 static uint32_t cho_ph, cho_inc, rv_ph1, rv_ph2;
-static int32_t cho_depth_k, cho_mix, dly_mix, rev_mix, dly_fb, dly_tone_k, rev_decay, rev_damp_k;
-static int32_t p_dly_to_rev;                   /* part 1's REVERB MIX: how much of the echoes go into the reverb */
-static int32_t dly_time, dly_cur;               /* Q16 samples: the target and where the read is (it slews like a tape) */
-static int32_t dly_lpl, dly_lpr, rv_lp_in, rv_lpl, rv_lpr, rv_yl, rv_yr;
+static int32_t cho_depth_k, cho_mix, sh_mix, rev_mix, sh_fb, sh_tone_k, rev_decay, rev_damp_k;
+static int32_t sh_lp, sh_hp, sh_out;            /* the shifted signal's tone (a one-pole low-pass, a DC block), its last sample */
+static int32_t sh_env, sh_fb_now, sh_in_lp;               /* the shifted level; BLOOM as this call applies it (ridden by the level) */
+static uint32_t sh_ph;                          /* 0 .. SH_W - 1: head A's place in its grain */
+static int32_t rv_lp_in, rv_lpl, rv_lpr, rv_yl, rv_yr;
 #if REV_DIV == 2u
 static int32_t rv_hold;
 #endif
-static uint32_t rev_pre_n = 1, dly_active, rev_active;
+static uint32_t rev_pre_n = 1, sh_active, rev_active;
 #if REV_DIV == 2u
 static uint32_t fx_odd;
 #endif
@@ -84,13 +87,11 @@ static uint32_t fx_odd;
 static void fx_init(void)
 {
     line_init(&cho, CHO_N);
-    line_init(&dl, DLY_MAX);
-    line_init(&dr, DLY_MAX);
+    line_init(&shl, SH_N);
     line_init(&rv_pre, REV_PRE_N);
     line_init(&rv_in[0], RV_IN1); line_init(&rv_in[1], RV_IN2); line_init(&rv_in[2], RV_IN3); line_init(&rv_in[3], RV_IN4);
     line_init(&rv_ap1, RV_AP1 + 16u); line_init(&rv_d1, RV_D1); line_init(&rv_ap2, RV_AP2); line_init(&rv_d2, RV_D2);
     line_init(&rv_ap3, RV_AP3 + 16u); line_init(&rv_d3, RV_D3); line_init(&rv_ap4, RV_AP4); line_init(&rv_d4, RV_D4);
-    dly_cur = dly_time = 11025 << 16;
 }
 
 /* the patch's numbers, once per ISR call. quarter: frames per quarter note (the arp's clock) */
@@ -99,14 +100,14 @@ static void fx_init(void)
 static void fx_block(const patch_t *p, uint32_t quarter, uint32_t any_c, uint32_t any_d, uint32_t any_r)
 {
     int32_t d, t;
-    uint32_t div = p->v[P_DLY_TIME] % NDDIV, samples;
+    (void)quarter;
     d = p->v[P_CHO_RATE]; cho_inc = (uint32_t)(10 + ((d * d * 590) >> 14)) * 974u;   /* 0.1 .. 5.9 Hz */
     cho_depth_k = p->v[P_CHO_DEPTH] * 67;       /* x the triangle's +-2048 = Q16 samples: up to +-6 ms */
     cho_mix = any_c != 0;                       /* the sends carry the levels: the returns are at full */
-    dly_mix = any_d != 0;
+    sh_mix = any_d != 0;                        /* P_DLY_MIX is each part's SHIMMER send now */
     rev_mix = any_r != 0;
-    dly_fb = p->v[P_DLY_FB] * 250;              /* up to 0.97 */
-    t = p->v[P_DLY_TONE]; dly_tone_k = clampi(((t * t) >> 6) + 8, 8, 256);
+    sh_fb = p->v[P_DLY_FB] * 100;               /* BLOOM: the tail back into the shifter, up to 0.39, less as it grows */
+    t = p->v[P_DLY_TONE]; sh_tone_k = clampi(((t * t) >> 6) + 8, 8, 256);   /* TONE: the shifted sound's brightness */
     d = p->v[P_REV_SIZE]; rev_decay = 12000 + ((d * d * 19500) >> 14);   /* 0.37 .. 0.96: the top is a near-freeze */
     d = p->v[P_REV_DAMP]; rev_damp_k = 32768 - d * d * 2;   /* the one-pole's k at the half rate */
     if (REV_DIV == 1u) {                        /* the same corner at the full rate: k' = 1 - sqrt(1 - k) */
@@ -115,14 +116,9 @@ static void fx_block(const patch_t *p, uint32_t quarter, uint32_t any_c, uint32_
             if ((r + bit) * (r + bit) <= x) r += bit;
         rev_damp_k = 32768 - (int32_t)r;
     }
-    p_dly_to_rev = p->v[P_REV_MIX];
     rev_pre_n = 1u + (uint32_t)p->v[P_REV_PRE] * (41u / REV_DIV);
-    samples = quarter * DDIV_NUM[div] / DDIV_DEN[div];
-    if (samples > DLY_MAX - 4u) samples = DLY_MAX - 4u;
-    if (samples < 64u) samples = 64u;
-    dly_time = (int32_t)(samples << 16);
-    if (dly_mix) dly_active = 12u * FS; else if (dly_active > HALF_FRAMES) dly_active -= HALF_FRAMES; else dly_active = 0;
-    if (rev_mix) rev_active = 24u * FS; else if (rev_active > HALF_FRAMES) rev_active -= HALF_FRAMES; else rev_active = 0;
+    if (sh_mix) sh_active = 24u * FS; else if (sh_active > HALF_FRAMES) sh_active -= HALF_FRAMES; else sh_active = 0;
+    if (rev_mix || sh_active) rev_active = 24u * FS; else if (rev_active > HALF_FRAMES) rev_active -= HALF_FRAMES; else rev_active = 0;
 }
 
 static inline __attribute__((always_inline)) int32_t line_read_q16(const line_t *l, int32_t back_q16)
@@ -215,8 +211,10 @@ static void lim_process(int32_t *out, uint32_t n)
 }
 static void fx_process(int32_t *out, const int32_t *bc, const int32_t *bd, const int32_t *br, uint32_t n)
 {
-    uint32_t i, do_dly = dly_active != 0, do_rev = rev_active != 0;
-    int32_t cm = cho_mix, d2r = (p_dly_to_rev * 180) >> 7;   /* d2r: the echoes into the reverb, part 1's reverb send */
+    uint32_t i, do_sh = sh_active != 0, do_rev = rev_active != 0;
+    int32_t cm = cho_mix;
+    sh_fb_now = (int32_t)((uint32_t)((sh_fb * (32768 - rev_decay)) >> 13) * 2048u / (2048u + (uint32_t)sh_env));   /* the louder the bloom, the less goes
+                                                   round again: it cannot run away, even with the reverb near a freeze */
     for (i = 0; i < n; i++) {
         int32_t l = out[2u * i], r = out[2u * i + 1u], rin = softclip(br[i]);   /* the sends soft-clipped as the dry is:
                                                    a loud part cannot drive the effects (and the sum) into the hard limit */
@@ -227,19 +225,25 @@ static void fx_process(int32_t *out, const int32_t *bc, const int32_t *bd, const
             l += line_read_q16_h(&cho, bl);
             r += line_read_q16_h(&cho, br2);
         }
-        if (do_dly) {                           /* ping-pong: the input enters left, the feedback crosses */
-            int32_t wl, wr;
-            if (dly_cur < dly_time) { dly_cur += 1 << 15; if (dly_cur > dly_time) dly_cur = dly_time; }
-            else if (dly_cur > dly_time) { dly_cur -= 1 << 15; if (dly_cur < dly_time) dly_cur = dly_time; }
-            wl = line_read_q16(&dl, dly_cur);
-            wr = line_read_q16(&dr, dly_cur);
-            dly_lpl += ((wr - dly_lpl) * dly_tone_k) >> 8;
-            dly_lpr += ((wl - dly_lpr) * dly_tone_k) >> 8;
-            line_write(&dl, softclip(bd[i]) + ((dly_lpl * dly_fb) >> 15));
-            line_write(&dr, (dly_lpr * dly_fb) >> 15);
-            l += wl;
-            r += wr;
-            rin += (((wl + wr) >> 1) * d2r) >> 8;
+        if (do_sh) {                            /* shimmer: two heads read twice as fast as the line is written (an
+                                                   octave up), each faded in and out over its grain, half a grain apart */
+            uint32_t pa = sh_ph, pb = pa + SH_W / 2u, ga, gb;
+            int32_t a, b, y;
+            if (pb >= SH_W) pb -= SH_W;
+            int32_t x = softclip(bd[i]) + (((rv_yl + rv_yr) >> 1) * sh_fb_now >> 15);
+            sh_in_lp += (x - sh_in_lp) >> 5;    /* a high-pass at ~220 Hz into the shifter: the grains' 21 Hz flutter
+                                                   cannot pile up as rumble round the loop (it only adds the top) */
+            line_write(&shl, x - sh_in_lp);
+            a = line_read(&shl, SH_W + 1u - pa);  /* (the distance shrinks a sample a sample: 2x speed) */
+            b = line_read(&shl, SH_W + 1u - pb);
+            ga = pa < SH_W / 2u ? pa : SH_W - pa; gb = SH_W / 2u - ga;   /* triangles: ga + gb = SH_W / 2 */
+            y = (a * (int32_t)ga + b * (int32_t)gb) >> 10;
+            if (++sh_ph >= SH_W) sh_ph = 0;
+            sh_lp += ((y - sh_lp) * sh_tone_k) >> 8;
+            sh_hp += (sh_lp - sh_hp) >> 9;      /* (a DC block: the loop must not creep) */
+            sh_out = sh_lp - sh_hp;
+            { int32_t m = sh_out < 0 ? -sh_out : sh_out; sh_env += (m - sh_env) >> (m > sh_env ? 7 : 13); }
+            rin += (softclip(bd[i]) >> 1) + sh_out;   /* into the plate: the send itself and its octave, heard in the reverb */
         }
         if (do_rev) {
 #if REV_DIV == 2u                               /* half rate: a pair in, the output interpolated between ticks */

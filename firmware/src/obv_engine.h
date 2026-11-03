@@ -138,6 +138,8 @@ static void voice_start(voice_t *v, uint32_t part, uint32_t note, uint32_t vel, 
 
 /* round robin over the cards; steal the oldest released, then the part's own oldest, then the oldest. `avoid`:
  * a bit per voice this trigger already took (DUAL / UNISON must not take one card twice) */
+static volatile uint32_t ctl_keep;             /* bit p: part p's held voices are never stolen by another part (drones) */
+static inline int voice_kept(uint32_t v, uint32_t part) { return vc[v].part != part && vc[v].gate && (ctl_keep >> vc[v].part & 1u); }
 static uint32_t voice_alloc(uint32_t part, uint32_t avoid)
 {
     uint32_t i, v, pick = 0, best = 0xFFFFFFFFu;
@@ -150,6 +152,9 @@ static uint32_t voice_alloc(uint32_t part, uint32_t avoid)
     if (best == 0xFFFFFFFFu)
         for (v = 0; v < NV; v++)
             if (!(avoid >> v & 1u) && vc[v].part == part && vc[v].seq < best) { best = vc[v].seq; pick = v; }
+    if (best == 0xFFFFFFFFu)                    /* the oldest of all, a kept (drone) part's voices spared */
+        for (v = 0; v < NV; v++)
+            if (!(avoid >> v & 1u) && !voice_kept(v, part) && vc[v].seq < best) { best = vc[v].seq; pick = v; }
     if (best == 0xFFFFFFFFu)
         for (v = 0; v < NV; v++)
             if (!(avoid >> v & 1u) && vc[v].seq < best) { best = vc[v].seq; pick = v; }
