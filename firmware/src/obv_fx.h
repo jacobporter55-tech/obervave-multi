@@ -118,12 +118,11 @@ static void fx_block(const patch_t *p, uint32_t quarter, uint32_t any_c, uint32_
     cho_mix = any_c != 0;                       /* the sends carry the levels: the returns are at full */
     sh_mix = any_d != 0;                        /* P_DLY_MIX is each part's SHIMMER send now */
     rev_mix = any_r != 0;
-    /* the pad-and-drone build: one long shimmer hall, set here (the patches' reverb and shimmer knobs are not used) */
-    sh_fb = SH_FB;                              /* the tail back into the shifter (ridden down as it grows) */
-    sh_tone_k = SH_TONE;                        /* the shifted sound's brightness */
-    rev_decay = SH_DECAY;                       /* the plate's decay */
+    /* JPad: the shimmer hall's sound from the drone's (part 3's) SHIMMER page: DECAY, BLOOM, TONE */
+    d = p->v[P_DLY_FB]; sh_fb = (d * d * 32) >> 4;          /* BLOOM: 0 .. ~0.7 back into the shifter (ridden down as it grows) */
+    t = p->v[P_DLY_TONE]; sh_tone_k = clampi(((t * t) >> 6) + 6, 6, 256);   /* TONE: dark .. bright octave */
+    d = p->v[P_REV_SIZE]; rev_decay = 20000 + ((d * d * 11600) >> 14);   /* DECAY: 0.61 .. 0.96 (about 2 s .. 30 s) */
     rev_damp_k = SH_DAMP;                       /* the one-pole's k at the half rate */
-    (void)t;
     if (REV_DIV == 1u) {                        /* the same corner at the full rate: k' = 1 - sqrt(1 - k) */
         uint32_t x = (uint32_t)(32768 - rev_damp_k) << 15, r = 0, bit = 1u << 15;
         for (; bit; bit >>= 1)
@@ -227,7 +226,7 @@ static void fx_process(int32_t *out, const int32_t *bc, const int32_t *bd, const
 {
     uint32_t i, do_sh = sh_active != 0, do_rev = rev_active != 0;
     int32_t cm = cho_mix;
-    sh_fb_now = (int32_t)((uint32_t)sh_fb * 2048u / (2048u + (uint32_t)sh_env));   /* the louder the bloom, the less goes
+    sh_fb_now = (int32_t)((uint32_t)((sh_fb * (32768 - rev_decay)) >> 14) * 2048u / (2048u + (uint32_t)sh_env));   /* the louder the bloom, the less goes
                                                    round again: it cannot run away, even with the reverb near a freeze */
     for (i = 0; i < n; i++) {
         int32_t l = out[2u * i], r = out[2u * i + 1u], rin = softclip(br[i]);   /* the sends soft-clipped as the dry is:
@@ -257,7 +256,7 @@ static void fx_process(int32_t *out, const int32_t *bc, const int32_t *bd, const
             sh_hp += (sh_lp - sh_hp) >> 9;      /* (a DC block: the loop must not creep) */
             sh_out = sh_lp - sh_hp;
             { int32_t m = sh_out < 0 ? -sh_out : sh_out; sh_env += (m - sh_env) >> (m > sh_env ? 7 : 13); }
-            rin += (softclip(bd[i]) >> 1) + sh_out;   /* into the plate: the send itself and its octave, heard in the reverb */
+            rin += (softclip(bd[i]) >> 1) + sh_out + (sh_out >> 1);   /* into the plate: the send and its octave (x1.5) */
         }
         if (do_rev) {
 #if REV_DIV == 2u                               /* half rate: a pair in, the output interpolated between ticks */

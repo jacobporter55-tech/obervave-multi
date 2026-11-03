@@ -50,9 +50,10 @@ static struct {
 #define SRC_OFF 0u
 #define SRC_KEYS 17u
 #define ROUTE_MAGIC 0xA7u
-#define SRC_POS(s) ((s) == SRC_KEYS ? 0u : (uint32_t)(s) + 1u)   /* the SOURCE knob, left to right: KEYS, OFF, CH 1 .. 16 */
-#define SRC_AT(k) ((k) == 0 ? SRC_KEYS : (uint32_t)(k) - 1u)
-#define MIDI_LAYER 18u                          /* GLOBAL MIDI: every part listens where its ROUTING page says */
+#define SRC_POS(s) ((s) == SRC_KEYS ? 0u : (s) == SRC_OFF ? 1u : 2u)   /* the SOURCE knob, left to right: KEYS, OFF, MIDI */
+#define SRC_AT(k) ((k) == 0 ? SRC_KEYS : (k) == 1 ? SRC_OFF : 1u)
+#define MIDI_LAYER 18u
+#define SRC_IS_MIDI(s) ((s) >= 1u && (s) <= 16u)   /* JPad: any channel number = MIDI, omni */                          /* GLOBAL MIDI: every part listens where its ROUTING page says */
 #define SET_OLD_SIZE ((uint32_t)((uint8_t *)&set.pprog - (uint8_t *)&set))   /* 1.2's settings: up to the programs */
 static uint32_t set_dirty, set_t;
 
@@ -126,11 +127,20 @@ static uint32_t seq_pages(uint32_t t) { return pat.trk[t].len ? (pat.trk[t].len 
 static uint8_t cc_map[128];                     /* MIDI CC -> parameter + 1, 0 = none */
 
 static uint32_t mix_keep;                       /* 1 once the parts are loaded at start */
-static void keep_mix(patch_t *p, const patch_t *old)   /* LAYER: a new preset keeps the layer's level and shimmer */
+static void layer_tame(patch_t *p)              /* JPad: a layer is low-pass, and its filter envelope leaves CUTOFF in charge */
 {
-    if (set.midi_ch != MIDI_LAYER || !mix_keep) return;
+    if (p->v[P_FTYPE] != F_LP12 && p->v[P_FTYPE] != F_LP24) p->v[P_FTYPE] = F_LP24;
+    p->v[P_FENV_AMT] = (uint8_t)clampi(p->v[P_FENV_AMT], 64 - 30, 64 + 30);
+}
+static void keep_mix(patch_t *p, const patch_t *old)   /* a new preset keeps the layer's level and the shimmer's settings */
+{
+    layer_tame(p);
+    if (!mix_keep) return;
     p->v[P_VOLUME] = old->v[P_VOLUME];
     p->v[P_DLY_MIX] = old->v[P_DLY_MIX];
+    p->v[P_DLY_FB] = old->v[P_DLY_FB];
+    p->v[P_DLY_TONE] = old->v[P_DLY_TONE];
+    p->v[P_REV_SIZE] = old->v[P_REV_SIZE];
 }
 static void load_program(uint32_t n)
 {
@@ -209,6 +219,8 @@ static void layer_note(uint32_t p, uint32_t on, uint32_t note, uint32_t vel, uin
 #define LAYER_HOME() (set.midi_ch == MIDI_LAYER && page == PG_PERFORM && !layer && !SMK_PAD_HELD)
 #define NLAYER 3u                               /* the simple pages: PAD 1, PAD 2, DRONE = parts 1-3 */
 static const char *const LAYER_NAME[NLAYER] = {"PAD 1", "PAD 2", "DRONE"};
+static uint32_t shim_page;                      /* 1: HOME's fourth page, SHIMMER (the drone's shimmer hall) */
+static const uint8_t SHIM_PARAM[4] = {P_DLY_MIX, P_REV_SIZE, P_DLY_FB, P_DLY_TONE};
 static void set_param(uint32_t p, int32_t v);
 static void set_param_part(uint32_t part, uint32_t p, int32_t v);
 static const uint8_t HOME_PART[4] = {0, 1, 2, 2}, HOME_PARAM[4] = {P_CUTOFF, P_CUTOFF, P_CUTOFF, P_DLY_MIX};
@@ -677,13 +689,14 @@ static void draw_page(void)
             else if (i < 3) { scat(k[i].value, "P"); fmt_u(k[i].value + 1, set.trk_part[i - 1u] + 1u); k[i].v = set.trk_part[i - 1u]; k[i].max = NPART - 1u; }
             else { fmt_u(k[i].value, live.v[P_VOLUME]); k[i].v = live.v[P_VOLUME]; k[i].max = 127; }
         } else if (LAYER_HOME()) {             /* PAD 1 / PAD 2 / DRONE: the panel's layer */
-            static const char *const LL4[4] = {"CUTOFF", "ATTACK", "RELEASE", "LEVEL"};
-            uint32_t q = LAYER_PARAM[i];
-            if (i == 3u && focus == 2u) q = P_DLY_MIX;
-            k[i].label = i == 3u && focus == 2u ? "SHIMMER" : LL4[i];
+            static const char *const LL4[4] = {"CUTOFF", "ATTACK", "RELEASE", "LEVEL"}, *const SH4[4] = {"MIX", "DECAY", "BLOOM", "TONE"};
+            uint32_t q = shim_page ? SHIM_PARAM[i] : LAYER_PARAM[i];
+            if (!shim_page && i == 3u && focus == 2u) q = P_DLY_MIX;
+            k[i].label = shim_page ? SH4[i] : i == 3u && focus == 2u ? "SHIMMER" : LL4[i];
             k[i].present = 1;
             k[i].v = live.v[q]; k[i].max = PDEF[q].max;
             if (q == P_DLY_MIX) { fmt_u(k[i].value, (uint32_t)live.v[q] * 100u / 127u); scat(k[i].value, "% WET"); }
+            else if (shim_page) { fmt_u(k[i].value, (uint32_t)live.v[q] * 100u / 127u); scat(k[i].value, "%"); }
             else param_value(k[i].value, q, (uint32_t)live.v[q]);
         } else if (page == PG_ROUTE && !layer && !SMK_PAD_HELD) {
             static const char *const RL[4] = {"PART", "SOURCE", "LATCH", "VOLUME"};
@@ -695,8 +708,8 @@ static void draw_page(void)
                 if (set.midi_ch != MIDI_LAYER) scat(k[i].value, "NOT LAYER");
                 else if (sr == SRC_OFF) scat(k[i].value, "OFF");
                 else if (sr == SRC_KEYS) scat(k[i].value, "KEYS");
-                else { scat(k[i].value, "CH "); fmt_u(k[i].value + 3, sr); }
-                k[i].v = SRC_POS(sr); k[i].max = SRC_KEYS;
+                else scat(k[i].value, "MIDI");
+                k[i].v = SRC_POS(sr); k[i].max = 2;
             } else if (i == 2) { scat(k[i].value, sr != SRC_KEYS ? "-" : set.platch[focus] ? "ON" : "OFF"); k[i].v = set.platch[focus]; k[i].max = 1; }
             else { fmt_u(k[i].value, live.v[P_VOLUME]); k[i].v = live.v[P_VOLUME]; k[i].max = 127; }
         } else if (layer == L_EDIT || layer == L_FX || layer == L_GLO || layer == L_SAVE) {
@@ -715,7 +728,7 @@ static void draw_page(void)
     {
         static char title[24];
         const char *t = pg->title;
-        if (LAYER_HOME()) t = focus < NLAYER ? LAYER_NAME[focus] : "PERFORM";
+        if (LAYER_HOME()) t = shim_page ? "SHIMMER" : focus < NLAYER ? LAYER_NAME[focus] : "PERFORM";
         else if (layer == L_EDIT) t = seq_trk ? "EDIT B: ERASE" : "EDIT A: ERASE";
         else if (layer == L_GLO) t = "GLO: MUTE SOLO TAP";
         else if (layer == L_SAVE) t = "SAVE: PATTERNS";
@@ -1021,7 +1034,7 @@ static void app_main(void)
             set.version = SET_VERSION;
             set.tempo = 120;
             for (n = 0; n < NPART; n++) set.pprog[n] = (uint8_t)n;
-            set.pprog[0] = 8; set.pprog[1] = 14; set.pprog[2] = 27;   /* SWEEP PAD + HOLLOW PAD on ch 1, VINTAGE PD the drone */
+            set.pprog[0] = 8; set.pprog[1] = 28; set.pprog[2] = 27;   /* SWEEP PAD + NEON PAD on MIDI, VINTAGE PD the drone */
             set.trk_part[0] = set.trk_part[1] = 0;
             set.focus = 0;
             route_defaults();
@@ -1050,6 +1063,7 @@ static void app_main(void)
     load_pattern(set.pat);
     ctl_panic = 0;
     route_apply();
+    { uint32_t n; for (n = 0; n < NPART; n++) layer_tame(&parts[n]); }
     mix_keep = 1;
 
     ui_splash();
@@ -1192,12 +1206,15 @@ static void app_main(void)
         if (b & (1u << BTN_HOME)) {             /* HOME: PERFORM; while a layer is held: lock it open; locked: let it go */
             if (layer && !layer_lock) { layer_lock = 1; layer_used = 1; say("LOCKED: ITS BUTTON ENDS IT"); }
             else if (layer_lock) { layer = L_NONE; layer_lock = 0; dirty_page = dirty_steps = dirty_tags = 1; leds_q = 0xFFFFFFFFu; }
-            else if (set.midi_ch == MIDI_LAYER && page == PG_PERFORM) {   /* LAYER: HOME steps PAD 1 > PAD 2 > DRONE */
-                focus_set(focus + 1u < NLAYER ? focus + 1u : 0u);
+            else if (set.midi_ch == MIDI_LAYER && page == PG_PERFORM) {   /* HOME steps PAD 1 > PAD 2 > DRONE > SHIMMER */
+                if (shim_page) { shim_page = 0; focus_set(0); }
+                else if (focus + 1u < NLAYER) focus_set(focus + 1u);
+                else { shim_page = 1; focus_set(2); }
                 dirty_hdr = dirty_tags = dirty_page = 1;
                 set_dirty = 1; set_t = fm1_ms;
             } else {
                 np = PG_PERFORM;
+                shim_page = 0;
                 if (set.midi_ch == MIDI_LAYER && focus >= NLAYER) focus_set(0);
             }
         }
@@ -1294,7 +1311,7 @@ static void app_main(void)
                 set_dirty = 1; set_t = fm1_ms;
                 dirty_hdr = dirty_tags = 1;
             } else if (LAYER_HOME()) {
-                uint32_t q = k == 3u && focus == 2u ? P_DLY_MIX : LAYER_PARAM[k];
+                uint32_t q = shim_page ? SHIM_PARAM[k] : k == 3u && focus == 2u ? P_DLY_MIX : LAYER_PARAM[k];
                 set_param(q, (int32_t)live.v[q] + e * 2);
                 set_dirty = 1; set_t = fm1_ms;
                 dirty_hdr = dirty_tags = 1;
@@ -1303,7 +1320,7 @@ static void app_main(void)
                 if (k == 0) focus_set((uint32_t)clampi((int32_t)focus + d, 0, NPART - 1));
                 else if (k == 1 && set.midi_ch == MIDI_LAYER) {
                     latch_drop(focus);
-                    set.psrc[focus] = (uint8_t)SRC_AT(clampi((int32_t)SRC_POS(set.psrc[focus]) + d, 0, SRC_KEYS));
+                    set.psrc[focus] = (uint8_t)SRC_AT(clampi((int32_t)SRC_POS(set.psrc[focus]) + d, 0, 2));
                     route_apply();
                 } else if (k == 2) { set.platch[focus] = d > 0; route_apply(); }
                 else if (k == 3) set_param(P_VOLUME, (int32_t)live.v[P_VOLUME] + e);
@@ -1367,13 +1384,13 @@ static void app_main(void)
                     continue;
                 }
                 if (kind == 0xC0u) {            /* one sound a program change: the panel's part if it is here, else the first */
-                    for (p = 0; p < NPART && set.psrc[p] != ch; p++) ;
-                    if (set.psrc[focus] == ch) p = focus;
+                    for (p = 0; p < NPART && !SRC_IS_MIDI(set.psrc[p]); p++) ;
+                    if (SRC_IS_MIDI(set.psrc[focus])) p = focus;
                     if (p < NPART) { load_program_part(p, d1); set_dirty = 1; set_t = fm1_ms; dirty_hdr = dirty_page = dirty_tags = 1; }
                     continue;
                 }
                 for (p = 0; p < NPART; p++) {
-                    if (set.psrc[p] != ch) continue;
+                    if (!SRC_IS_MIDI(set.psrc[p])) continue;   /* JPad: the pads hear every channel (omni) */
                     if (kind == 0x90u && d2) layer_note(p, 1, d1, d2, 0);
                     else if (kind == 0x80u || kind == 0x90u) layer_note(p, 0, d1, 0, 0);
                     else if (kind == 0xE0u) ctl_bend[p] = (int32_t)(d1 | d2 << 7) - 8192;
